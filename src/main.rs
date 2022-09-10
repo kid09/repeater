@@ -15,7 +15,7 @@ use serenity::model::webhook::Webhook;
 use serenity::model::user::User;
 use serenity::model::channel::AttachmentType;
 use serenity::model::event::MessageUpdateEvent;
-use serenity::model::id::MessageId;
+use serenity::model::id::{MessageId,ChannelId,GuildId};
 use serenity::prelude::*;
 
 
@@ -27,6 +27,9 @@ struct Bot {
 	
 	// Key: ID of the message.  Value: (ID of message, ID of channel) which have been repeated.
 	message_cache : Mutex<HashMap<u64, Vec<(u64, u64)>>>,
+	
+	// Key: ID of the message.  Value: ID of author.
+	message_author_cache : Mutex<HashMap<u64, u64>>,
 	
 	// Key: (ID of channel, ID of user).  Value: ID of the webhook.
 	webhook_cache : Mutex<HashMap<(u64,u64),u64>>,
@@ -92,6 +95,44 @@ impl Bot {
 			}
 		}
 	}
+	
+	
+	// Get a copy of the message cache.
+	async fn get_message_cache(&self, message_id : u64) -> Option<Vec<(u64, u64)>> {
+		let msg_cache_mutex = self.message_cache.lock().unwrap();
+		if msg_cache_mutex.contains_key(&message_id) == true {
+			let mut value : Vec<(u64, u64)> = Vec::new();
+			for (repeated_message_id, repeated_channel_id) in msg_cache_mutex[&message_id].iter() {
+				value.push((*repeated_message_id, *repeated_channel_id));
+			}
+			
+			Some(value)
+		} else {
+			None
+		}
+	}
+	
+	
+	// Get a copy of the webhook cache.
+	async fn get_webhook_cache(&self, channel_id : u64, author_id : u64) -> Option<u64> {
+		let webhook_cache = self.webhook_cache.lock().unwrap();
+		let pair = (channel_id, author_id);
+		match webhook_cache.get(&pair) {
+			Some(id) => Some(*id),
+			None => None,
+		}
+	}
+	
+	
+	// Get a copy of the message author cache.
+	async fn get_message_author_cache(&self, message_id : u64) -> Option<u64> {
+		let msg_author_cache = self.message_author_cache.lock().unwrap();
+		match msg_author_cache.get(&message_id) {
+			Some(id) => Some(*id),
+			None => None,
+		}
+	}
+	
 	
 	// Create a webhook for a user.
 	async fn create_user_webhook(&self, ctx: &Context, msg: &Message, _ : &User, target_channel : &Channel) -> Result<Webhook, SerenityError> {
@@ -163,41 +204,40 @@ impl EventHandler for Bot {
 		};
 		
 
-		// Make a copy of the message cache.
-		let cached_messages_opt : Option<Vec<(u64, u64)>> = {
-			let msg_cache_mutex = self.message_cache.lock().unwrap();
-			if msg_cache_mutex.contains_key(&message_id) == true {
-				let mut value : Vec<(u64, u64)> = Vec::new();
-				for (repeated_message_id, repeated_channel_id) in msg_cache_mutex[&message_id].iter() {
-					value.push((*repeated_message_id, *repeated_channel_id));
-				}
-				
-				Some(value)
-			} else {
-				None
-			}
-		};
-		
-		
 		// Repeat the message edit.
-		if let Some(cached_messages) = cached_messages_opt {
+		if let Some(cached_messages) = self.get_message_cache(message_id).await {
 			for (repeated_message_id, _repeated_channel_id) in cached_messages {
-				let webhook_id = {
-					let webhook_cache = self.webhook_cache.lock().unwrap();
-					let pair = (channel_id, author_id);
-					match webhook_cache.get(&pair) {
-						Some(id) => *id,
-						None => { 
-							println!("Nothing found in webhook cache. We looked for: {:?}", pair);
-							continue;
-						}
-					}
+				let webhook_id = match self.get_webhook_cache(channel_id, author_id).await {
+					Some(id) => id,
+					None => continue,
 				};
 				
 				match Webhook::from_id(&ctx.http, webhook_id).await {
 					Ok(webhook) => match webhook.edit_message(&ctx.http, MessageId::from(repeated_message_id), |m| m.content(&message_content)).await {
 						Ok(_) => continue,
 						Err(why) => println!("Couldn't edit message: {:?}", why),
+					}
+					Err(why) => println!("Couldn't get webhook from id: {:?}", why),
+				}
+			}
+		}
+	}
+	
+	async fn message_delete(&self, ctx: Context, channel_id : ChannelId, deleted_message_id : MessageId, _guild_id : Option<GuildId>) {
+		if let Some(cached_messages) = self.get_message_cache(*deleted_message_id.as_u64()).await {
+			let message_id = *deleted_message_id.as_u64();
+			let author_id = self.get_message_author_cache(message_id).await.unwrap();
+			
+			for (repeated_message_id, _repeated_channel_id) in cached_messages {
+				let webhook_id = match self.get_webhook_cache(*channel_id.as_u64(), author_id).await {
+					Some(id) => id,
+					None => continue,
+				};
+				
+				match Webhook::from_id(&ctx.http, webhook_id).await {
+					Ok(webhook) => match webhook.delete_message(&ctx.http, MessageId::from(repeated_message_id)).await {
+						Ok(_) => continue,
+						Err(why) => println!("Couldn't delete message: {:?}", why),
 					}
 					Err(why) => println!("Couldn't get webhook from id: {:?}", why),
 				}
@@ -253,10 +293,15 @@ impl EventHandler for Bot {
 			}
 		}
 		
-		// Save messages into the cache.
+		// Save cache information.
 		{
 			let mut msg_cache = self.message_cache.lock().unwrap();
 			msg_cache.insert(*msg.id.as_u64(), cache);
+		}
+		
+		{
+			let mut msg_author_cache = self.message_author_cache.lock().unwrap();
+			msg_author_cache.insert(*msg.id.as_u64(), *msg.author.id.as_u64());
 		}
 	}
 	
