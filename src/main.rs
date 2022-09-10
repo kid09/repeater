@@ -14,6 +14,8 @@ use serenity::model::gateway::Ready;
 use serenity::model::webhook::Webhook;
 use serenity::model::user::User;
 use serenity::model::channel::AttachmentType;
+use serenity::model::event::MessageUpdateEvent;
+use serenity::model::id::MessageId;
 use serenity::prelude::*;
 
 
@@ -23,8 +25,8 @@ struct Bot {
 	// Key: ID of the channel.  Value: ID of channels in which to repeat message.
 	direct_messages_to : HashMap<u64, Vec<u64>>,
 	
-	// Key: ID of the message.  Value: ID of messages which have been repeated.
-	message_cache : Mutex<HashMap<u64, Vec<u64>>>,
+	// Key: ID of the message.  Value: (ID of message, ID of channel) which have been repeated.
+	message_cache : Mutex<HashMap<u64, Vec<(u64, u64)>>>,
 	
 	// Key: (ID of channel, ID of user).  Value: ID of the webhook.
 	webhook_cache : Mutex<HashMap<(u64,u64),u64>>,
@@ -63,11 +65,6 @@ impl Bot {
 			self.direct_messages_to.insert(key, value);
 		}
 	}
-	
-	
-	/*fn save(&self) {
-
-	}*/
 }
 
 
@@ -151,18 +148,68 @@ impl Bot {
 
 #[async_trait]
 impl EventHandler for Bot {
-/*
-	async fn message(&self, ctx: Context, msg: Message) {
-		self.send_pong(&ctx, &msg).await;
-		println!("[{}] [{}] {}", msg.channel_id, msg.author.name, msg.content);
-	}
-*/
+	async fn message_update(&self, ctx: Context, _old_msg : Option<Message>, _new_msg : Option<Message>, update_event : MessageUpdateEvent) {
+		// Get data from the message.
+		let channel_id = *update_event.channel_id.as_u64();
+		let message_id = *update_event.id.as_u64();
+		let author_id = match update_event.author {
+			Some(author) => *author.id.as_u64(),
+			None => *ctx.http.get_message(*update_event.channel_id.as_u64(), *update_event.id.as_u64()).await.unwrap().author.id.as_u64(),
+		};
+		
+		let message_content = match update_event.content {
+			Some(content) => content,
+			None => { return; }
+		};
+		
 
+		// Make a copy of the message cache.
+		let cached_messages_opt : Option<Vec<(u64, u64)>> = {
+			let msg_cache_mutex = self.message_cache.lock().unwrap();
+			if msg_cache_mutex.contains_key(&message_id) == true {
+				let mut value : Vec<(u64, u64)> = Vec::new();
+				for (repeated_message_id, repeated_channel_id) in msg_cache_mutex[&message_id].iter() {
+					value.push((*repeated_message_id, *repeated_channel_id));
+				}
+				
+				Some(value)
+			} else {
+				None
+			}
+		};
+		
+		
+		// Repeat the message edit.
+		if let Some(cached_messages) = cached_messages_opt {
+			for (repeated_message_id, _repeated_channel_id) in cached_messages {
+				let webhook_id = {
+					let webhook_cache = self.webhook_cache.lock().unwrap();
+					let pair = (channel_id, author_id);
+					match webhook_cache.get(&pair) {
+						Some(id) => *id,
+						None => { 
+							println!("Nothing found in webhook cache. We looked for: {:?}", pair);
+							continue;
+						}
+					}
+				};
+				
+				match Webhook::from_id(&ctx.http, webhook_id).await {
+					Ok(webhook) => match webhook.edit_message(&ctx.http, MessageId::from(repeated_message_id), |m| m.content(&message_content)).await {
+						Ok(_) => continue,
+						Err(why) => println!("Couldn't edit message: {:?}", why),
+					}
+					Err(why) => println!("Couldn't get webhook from id: {:?}", why),
+				}
+			}
+		}
+	}
 	
 	async fn message(&self, ctx: Context, msg: Message) {
 		// Display message on screen.
 		println!("[{}] [{}] {}", msg.channel_id, msg.author.name, msg.content);
-		println!("cache: {:?}", self.message_cache);
+		println!("message_cache: {:?}", self.message_cache);
+		println!("webhook_cache: {:?}", self.webhook_cache);
 		println!("counter: {:?}", self.message_counter);
 		
 		// Augument counter.
@@ -171,16 +218,9 @@ impl EventHandler for Bot {
 			*count += 1;
 		}
 		
-		// Ignore if message is from self.
-		if msg.author.id == ctx.cache.current_user_id() {
-			return;
-		}
-		
-		
-		// Ignore message if it is from webhook.
-		if msg.webhook_id.is_some() {
-			return;
-		}
+		// Ignore if message is from self, or from webhook.
+		if msg.author.id == ctx.cache.current_user_id() { return;}
+		if msg.webhook_id.is_some() { return; }
 		
 		
 		// Ping pong.
@@ -192,8 +232,10 @@ impl EventHandler for Bot {
 			return;
 		}
 		
+		// Create message cache: (ID of message, ID of channel)
+		let mut cache : Vec<(u64, u64)> = Vec::new();
+		
 		// Repeat message.
-		let mut cache : Vec<u64> = Vec::new();
 		for channel_id in self.direct_messages_to[msg.channel_id.as_u64()].iter() {
 			let text_channel = ctx.http.get_channel(*channel_id).await.unwrap();
 			let webhook_user = self.get_user_webhook(&ctx, &msg, &msg.author, &text_channel).await;
@@ -201,7 +243,7 @@ impl EventHandler for Bot {
 			// Finally, by all means, send the message.
 			if let Ok(webhook_object) = webhook_user {
 				match webhook_object.execute(&ctx.http, true, |w| w.content(&msg.content)).await {
-					Ok(response) => cache.push(*response.unwrap().id.as_u64()),
+					Ok(response) => cache.push((*response.unwrap().id.as_u64(), *channel_id)),
 					Err(why) => println!("Error sending message: {:?}", why),
 				}
 			}
