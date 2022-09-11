@@ -212,6 +212,7 @@ impl EventHandler for Bot {
 					None => continue,
 				};
 				
+				
 				match Webhook::from_id(&ctx.http, webhook_id).await {
 					Ok(webhook) => match webhook.edit_message(&ctx.http, MessageId::from(repeated_message_id), |m| m.content(&message_content)).await {
 						Ok(_) => continue,
@@ -282,7 +283,14 @@ impl EventHandler for Bot {
 
 			// Finally, by all means, send the message.
 			if let Ok(webhook_object) = webhook_user {
-				match webhook_object.execute(&ctx.http, true, |w| w.content(&msg.content)).await {
+				match webhook_object.execute(&ctx.http, true, |w| {
+					for attachment in msg.attachments.iter() {
+						if attachment.height.is_some() {
+							w.add_file(AttachmentType::Image(Url::parse(&attachment.url).unwrap()));
+						}
+					}
+					w.content(&msg.content)
+				}).await {
 					Ok(response) => cache.push((*response.unwrap().id.as_u64(), *channel_id)),
 					Err(why) => println!("Error sending message: {:?}", why),
 				}
